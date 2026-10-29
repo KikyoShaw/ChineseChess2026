@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import type { Settings, Side } from './types'
 import { useGame } from './composables/useGame'
 import { clockText, pieceImage, reasonText, requestNames, sideName } from './composables/chess'
@@ -17,6 +18,7 @@ const {
   openPosition, savePosition, hostLan, joinLan, leaveLan, respondRequest,
   notify, dismissToast, dismissError,
 } = useGame()
+const openingRepository = ref(false)
 const dialog = ref<'settings' | 'lan' | 'about' | null>(null)
 const confirmation = ref<'restart' | 'resign' | 'draw' | 'open' | null>(null)
 const isBusy = computed(() => busy.value !== null || moving.value)
@@ -99,6 +101,18 @@ const confirmCopy = computed(() => {
     default: return { title: inLan.value ? '申请重新开局？' : '重新开一局？', description: inLan.value ? '将向对手发送重开请求。对手同意后，双方沿用当前房间设置重新开始。' : '当前对局将被新局替换，新局沿用当前设置。想留住这盘棋，可以先保存。', label: inLan.value ? '发送重开请求' : '重新开局', icon: 'plus', danger: false }
   }
 })
+
+async function openRepository() {
+  if (openingRepository.value) return
+  openingRepository.value = true
+  try {
+    await invoke('open_repository')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : String(error), 'error')
+  } finally {
+    openingRepository.value = false
+  }
+}
 
 function showDialog(name: 'settings' | 'lan' | 'about') {
   if (isBusy.value || requestDialogOpen.value) return
@@ -197,7 +211,11 @@ onUnmounted(() => document.removeEventListener('keydown', shortcuts))
   <div class="app-shell">
     <header class="app-header">
       <div class="brand"><span class="brand-seal" aria-hidden="true">弈</span><div><h1>弈 <span>·</span> 中国象棋</h1><p>方寸之间，自有乾坤</p></div></div>
-      <div class="header-right"><span class="header-motto">以棋会友 · 落子有声</span><button class="header-about" type="button" title="关于、来源与对弈规则" :disabled="isBusy || requestDialogOpen" @click="showDialog('about')"><UiIcon name="info" :size="18" /><span>关于</span></button></div>
+      <div class="header-right">
+        <span class="header-motto">以棋会友 · 落子有声</span>
+        <button class="header-about" type="button" title="在浏览器中打开 GitHub 项目" aria-label="打开 GitHub 项目仓库" :disabled="openingRepository" @click="openRepository"><UiIcon name="github" :size="18" /><span>GitHub</span></button>
+        <button class="header-about" type="button" title="关于、来源与对弈规则" :disabled="isBusy || requestDialogOpen" @click="showDialog('about')"><UiIcon name="info" :size="18" /><span>关于</span></button>
+      </div>
     </header>
 
     <nav class="main-toolbar" aria-label="对局工具栏">

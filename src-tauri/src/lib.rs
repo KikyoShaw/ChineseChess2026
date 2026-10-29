@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tauri::{Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
 mod game;
 mod network;
@@ -7,6 +8,13 @@ mod session;
 mod storage;
 
 use session::{Hub, Settings, Snapshot};
+
+#[tauri::command]
+fn open_repository(app: tauri::AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_url("https://github.com/KikyoShaw/ChineseChess2026", None::<&str>)
+        .map_err(|error| format!("无法打开项目地址：{error}"))
+}
 
 #[tauri::command]
 fn get_snapshot(hub: State<'_, Arc<Hub>>) -> Snapshot { hub.snapshot() }
@@ -73,6 +81,7 @@ fn respond_request(hub: State<'_, Arc<Hub>>, id: u64, accept: bool, revision: u6
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let directory = app.path().app_config_dir()?;
             let hub = Hub::new(app.handle().clone(), directory);
@@ -82,7 +91,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            get_snapshot, new_game, make_move, game_action, update_preferences,
+            get_snapshot, new_game, make_move, game_action, update_preferences, open_repository,
             open_position, save_position, host_lan, join_lan, leave_lan, respond_request,
         ])
         .build(tauri::generate_context!())
