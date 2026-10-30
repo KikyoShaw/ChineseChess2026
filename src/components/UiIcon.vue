@@ -2,6 +2,8 @@
 withDefaults(defineProps<{ name: string; size?: number }>(), { size: 20 })
 const paths: Record<string, string> = {
   plus: 'M12 5v14M5 12h14',
+  play: 'm8 4 12 8-12 8V4Z',
+  pause: 'M8 4v16M16 4v16',
   undo: 'M9 5 4 10l5 5M4 10h9a6 6 0 0 1 0 12',
   flip: 'M7 4 3 8l4 4M3 8h12a5 5 0 0 1 5 5M17 20l4-4-4-4M21 16H9a5 5 0 0 1-5-5',
   folder: 'M3 8V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8Z',

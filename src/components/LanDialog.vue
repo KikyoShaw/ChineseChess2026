@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, useId, watch } from 'vue'
-import type { NetworkView, Settings, Side } from '../types'
+import type { GamePhase, NetworkView, Settings, Side } from '../types'
 import AppDialog from './AppDialog.vue'
 import UiIcon from './UiIcon.vue'
 
-const props = defineProps<{ open: boolean; settings: Settings; network: NetworkView; active: boolean; busy: boolean; error: string }>()
+const props = defineProps<{ open: boolean; phase: GamePhase; settings: Settings; network: NetworkView; active: boolean; busy: boolean; error: string }>()
 const emit = defineEmits<{
   close: []
   host: [port: number, settings: Settings]
@@ -28,6 +28,17 @@ const statusTitle = computed(() => ({
   offline: '房间已就绪', hosting: '等待对手加入', connecting: '正在连接房间',
   connected: '对手已连接', disconnected: '连接已断开',
 })[props.network.status])
+const roomDescription = computed(() => {
+  if (props.network.status === 'connected') {
+    if (props.phase === 'ready') return props.network.role === 'host' ? '对手已加入，请回到棋盘点击「开始」开局。' : '已加入房间，等待房主点击「开始」。'
+    if (props.phase === 'paused') return '棋局已暂停，等待房主点击「继续」。'
+    return '对局进行中，双方按各自的执子颜色行棋。'
+  }
+  if (props.network.status === 'disconnected') return props.phase === 'ready'
+    ? '连接已断开，棋局尚未开始。离开房间后可重新创建或加入。'
+    : '连接已断开，棋局已暂停并保留剩余用时。离开房间后可重新创建或加入。'
+  return props.network.message || (props.network.status === 'hosting' ? '将下方地址告诉对手，让对方在「加入房间」中输入。' : '正在与房主建立连接，请稍候。')
+})
 watch(() => props.open, open => {
   if (!open) return
   hostSide.value = props.settings.humanSide
@@ -48,13 +59,13 @@ function submit() {
     <div v-if="active" class="room-view">
       <div class="room-emblem" :class="{ connected: network.status === 'connected', disconnected: network.status === 'disconnected' }"><UiIcon name="lan" :size="32" /></div>
       <h3>{{ statusTitle }}</h3>
-      <p class="room-description">{{ network.message || (network.status === 'hosting' ? '将下方地址告诉对手，让对方在「加入房间」中输入。' : network.status === 'connecting' ? '正在与房主建立连接，请稍候。' : network.status === 'connected' ? '房间已连接，双方按自己的执子颜色行棋。' : '当前棋局已暂停。离开房间后可重新创建或加入。') }}</p>
+      <p class="room-description">{{ roomDescription }}</p>
       <div class="room-details">
         <div><span>房间身份</span><strong>{{ network.role === 'host' ? '房主' : network.role === 'guest' ? '访客' : '局域网玩家' }}</strong></div>
         <div><span>我的执子</span><strong :class="network.localSide === 'red' ? 'text-red' : ''">{{ network.localSide === 'red' ? '红方' : network.localSide === 'black' ? '黑方' : '等待分配' }}</strong></div>
         <div v-if="network.address" class="room-address"><span>连接地址</span><code>{{ network.address }}</code></div>
       </div>
-      <p class="form-note">{{ network.status === 'hosting' || network.status === 'connecting' ? '连接完成后自动开局；等待期间不计时。' : '离开房间会结束本次网络连接。' }}</p>
+      <p class="form-note">{{ network.status === 'hosting' || network.status === 'connecting' ? '连接后等待房主点击「开始」；等待期间不计时。' : '离开房间会断开连接并保留当前棋局。' }}开始、暂停和继续均由房主控制。</p>
       <p v-if="error" class="form-error" role="alert"><UiIcon name="alert" :size="17" />{{ error }}</p>
     </div>
     <form v-else :id="formId" class="lan-form" @submit.prevent="submit">
@@ -79,7 +90,7 @@ function submit() {
           <p class="notice"><UiIcon name="info" :size="18" />执子颜色、先行一方与用时由房主设定。</p>
         </div>
       </fieldset>
-      <p class="form-note">创建或加入房间将开始局域网对局。请确保双方在同一网络。</p>
+      <p class="form-note">创建或加入房间将准备局域网棋局，双方连接后由房主点击「开始」开局。请确保双方在同一网络。</p>
       <p v-if="error" class="form-error" role="alert"><UiIcon name="alert" :size="17" />{{ error }}</p>
     </form>
     <template #footer>

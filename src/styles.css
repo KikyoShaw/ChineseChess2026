@@ -67,6 +67,7 @@ code, kbd { font-family: "Cascadia Code", Consolas, monospace; }
 .button-danger-quiet { color: var(--red); border-color: #e8d3ca; background: #fcf4ef; }
 .button-danger-quiet:hover:not(:disabled) { border-color: #cd9e8c; background: #f5e5dc; }
 .toolbar-new { margin-right: 7px; padding: 8px 16px; min-height: 36px; }
+.toolbar-phase { min-width: 78px; min-height: 36px; padding: 8px 14px; }
 .toolbar-button { position: relative; display: inline-flex; justify-content: center; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #5b6257; font-size: 12px; min-height: 36px; white-space: nowrap; transition: background .15s, color .15s; }
 .toolbar-button:hover:not(:disabled) { color: var(--ink); background: #efede4; }
 .toolbar-sound { min-width: 36px; padding: 8px; }

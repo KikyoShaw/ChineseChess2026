@@ -49,7 +49,7 @@ export function useGame() {
   const networkReady = computed(() => !inLan.value || snapshot.value?.network.status === 'connected')
   const clockRunning = computed(() => {
     const state = snapshot.value
-    return !!state && !state.result && state.remainingMs !== null && networkReady.value
+    return !!state && state.phase === 'running' && !state.result && state.remainingMs !== null && networkReady.value
   })
   const remainingMs = computed(() => {
     const remaining = snapshot.value?.remainingMs ?? null
@@ -58,10 +58,15 @@ export function useGame() {
   })
   const canPlay = computed(() => {
     const state = snapshot.value
-    if (!state || state.result || state.thinking || awaitingPeerAction.value || busy.value || moving.value || !networkReady.value) return false
+    if (!state || state.phase !== 'running' || state.result || state.thinking || awaitingPeerAction.value || busy.value || moving.value || !networkReady.value) return false
     if (state.settings.mode === 'computer') return state.turn === state.settings.humanSide
     if (inLan.value) return state.turn === state.network.localSide
     return true
+  })
+  const canControl = computed(() => {
+    const state = snapshot.value
+    if (!state || state.result || state.pendingRequest || awaitingPeerAction.value || busy.value || moving.value || !networkReady.value) return false
+    return !inLan.value || state.network.role === 'host'
   })
   const legalTargets = computed(() => new Set(
     snapshot.value?.legalMoves.filter(move => move.from === selected.value).map(move => move.to) ?? [],
@@ -119,8 +124,11 @@ export function useGame() {
     initializedSound = true
     lastSoundKey = soundKey
     if (previous && previous.network.status !== next.network.status) {
-      if (next.network.status === 'connected') notify('对手已连接，可以开始对弈。', 'success')
-      else if (next.network.status === 'disconnected') notify(next.network.message || '与对手的连接已断开。', 'error')
+      if (next.network.status === 'connected') {
+        const message = next.phase === 'ready' ? '对手已连接，等待房主点击「开始」。'
+          : next.phase === 'paused' ? '房间已连接，等待房主点击「继续」。' : '房间已连接，对局进行中。'
+        notify(message, 'success')
+      } else if (next.network.status === 'disconnected') notify(next.network.message || '与对手的连接已断开。', 'error')
     } else if (previous && next.network.message && next.network.message !== previous.network.message) {
       notify(next.network.message, 'info')
     }
@@ -212,7 +220,7 @@ export function useGame() {
   }
 
   function newGame(settings: Settings) {
-    return runSnapshot('new_game', { settings }, '新的一局，落子从容。')
+    return runSnapshot('new_game', { settings }, '新局已就绪，点击「开始」进入对局。')
   }
 
   async function peerCommand(command: string, args: Record<string, unknown>, action: ActionName | 'response') {
@@ -228,7 +236,7 @@ export function useGame() {
 
   function performAction(action: ActionName) {
     const state = snapshot.value
-    if (!state) return Promise.resolve(false)
+    if (!state || ((action === 'start' || action === 'pause' || action === 'resume') && !canControl.value)) return Promise.resolve(false)
     return peerCommand('game_action', { action, revision: state.revision, gameId: state.gameId }, action)
   }
 
@@ -291,7 +299,7 @@ export function useGame() {
 
   return {
     snapshot, selected, busy, moving, awaitingPeerAction, connection, startupError, commandError, toasts,
-    inLan, networkReady, canPlay, legalTargets, remainingMs, clockRunning,
+    inLan, networkReady, canPlay, canControl, legalTargets, remainingMs, clockRunning,
     initialize, selectSquare, newGame, performAction, updatePreferences,
     openPosition, savePosition, hostLan, joinLan, leaveLan, respondRequest,
     notify, dismissToast,

@@ -57,11 +57,16 @@ pub struct PendingRequest { pub id: u64, pub kind: String, pub from: Side }
 #[serde(rename_all = "camelCase")]
 pub struct ActionSignal { pub id: u64, pub sound: Option<String> }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GamePhase { Ready, Running, Paused }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub revision: u64,
     pub game_id: u64,
+    pub phase: GamePhase,
     pub board: Vec<Option<Piece>>,
     pub turn: Side,
     pub history: Vec<MoveRecord>,
@@ -82,7 +87,9 @@ struct Session {
     revision: u64,
     game_id: u64,
     position_revision: u64,
+    phase: GamePhase,
     deadline: Option<Instant>,
+    frozen_remaining: Option<Duration>,
     thinking: bool,
     ai_cancel: Arc<AtomicBool>,
     network: NetworkView,
@@ -102,7 +109,8 @@ impl Session {
     fn new(settings: Settings) -> Self {
         let game = Game::new(settings.first_side);
         let mut session = Self { game, settings, revision: 1, game_id: 1, position_revision: 1,
-            deadline: None, thinking: false, ai_cancel: Arc::new(AtomicBool::new(false)),
+            phase: GamePhase::Ready, deadline: None, frozen_remaining: None,
+            thinking: false, ai_cancel: Arc::new(AtomicBool::new(false)),
             network: NetworkView::default(), connection_id: 0, network_cancel: None, sender: None,
             remote: None, authority_revision: 0, request_counter: 0, last_peer_request: 0,
             pending: None, pending_since: None, action: ActionSignal { id: 0, sound: None } };
@@ -112,15 +120,28 @@ impl Session {
 
     fn guest(&self) -> bool { self.network.role.as_deref() == Some("guest") }
     fn running(&self) -> bool {
-        self.game.result.is_none() && (self.settings.mode != "lan" || self.network.status == "connected")
+        self.phase == GamePhase::Running && self.game.result.is_none()
+            && (self.settings.mode != "lan" || self.network.status == "connected")
     }
     fn reset_clock(&mut self) {
-        self.deadline = if self.running() && self.settings.step_seconds > 0 {
-            Some(Instant::now() + Duration::from_secs(self.settings.step_seconds.into()))
+        self.deadline = None;
+        self.frozen_remaining = if self.game.result.is_none() && self.settings.step_seconds > 0 {
+            Some(Duration::from_secs(self.settings.step_seconds.into()))
         } else { None };
+        if self.running() { self.resume_clock(); }
+    }
+    fn resume_clock(&mut self) {
+        self.deadline = self.frozen_remaining.take().map(|remaining| Instant::now() + remaining);
+    }
+    fn remaining_time(&self, now: Instant) -> Option<Duration> {
+        self.deadline.map(|deadline| deadline.saturating_duration_since(now)).or(self.frozen_remaining)
+    }
+    fn freeze_clock(&mut self, now: Instant) {
+        self.frozen_remaining = self.remaining_time(now);
+        self.deadline = None;
     }
     fn remaining(&self) -> Option<u64> {
-        self.deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()).as_millis() as u64)
+        self.remaining_time(Instant::now()).map(|remaining| remaining.as_millis() as u64)
     }
     fn touch(&mut self, sound: Option<&str>) {
         self.revision += 1;
@@ -158,6 +179,32 @@ impl Session {
         Ok(())
     }
     fn effective_game_id(&self) -> u64 { self.remote.as_ref().filter(|_| self.guest()).map_or(self.game_id, |remote| remote.game_id) }
+    fn control_phase(&mut self, action: &str) -> Result<(), String> {
+        if self.settings.mode == "lan" {
+            if self.network.role.as_deref() != Some("host") {
+                return Err("开始、暂停和继续由房主控制".into());
+            }
+            if self.network.status != "connected" { return Err("请先等待对手连接".into()); }
+        }
+        if self.game.result.is_some() { return Err("本局已经结束，请重新开局".into()); }
+        if self.pending.is_some() { return Err("请先处理当前协商请求".into()); }
+        match (action, self.phase) {
+            ("start", GamePhase::Ready) | ("resume", GamePhase::Paused) => {
+                self.phase = GamePhase::Running;
+                self.resume_clock();
+            }
+            ("pause", GamePhase::Running) => {
+                let now = Instant::now();
+                if self.expired_at(now) { return Err("本步已超时".into()); }
+                self.freeze_clock(now);
+                self.cancel_ai();
+                self.phase = GamePhase::Paused;
+            }
+            _ => return Err("对局状态已变化，请重新操作".into()),
+        }
+        self.touch(None);
+        Ok(())
+    }
     fn validate_version(&self, revision: u64, game_id: u64) -> Result<(), String> {
         if revision != self.revision || game_id != self.effective_game_id() {
             return Err("棋局已更新，请重新操作".into());
@@ -178,16 +225,15 @@ impl Session {
             result.settings = self.settings.clone();
             result.network = self.network.clone();
             result.action = self.action.clone();
-            result.remaining_ms = if self.network.status == "connected" && remote.result.is_none() {
-                self.remaining()
-            } else { remote.remaining_ms };
+            result.phase = self.phase;
+            result.remaining_ms = self.remaining();
             return result;
         }
-        Snapshot { revision: self.revision, game_id: self.game_id,
+        Snapshot { revision: self.revision, game_id: self.game_id, phase: self.phase,
             board: self.game.position.board.clone(), turn: self.game.position.turn,
             history: self.game.history.clone(), result: self.game.result.clone(),
             in_check: self.game.position.in_check(self.game.position.turn),
-            legal_moves: if self.game.result.is_none() { self.game.position.legal_moves() } else { Vec::new() },
+            legal_moves: if self.running() { self.game.position.legal_moves() } else { Vec::new() },
             settings: self.settings.clone(), remaining_ms: self.remaining(), thinking: self.thinking,
             network: self.network.clone(), pending_request: self.pending.clone(), action: self.action.clone() }
     }
@@ -198,8 +244,9 @@ impl Session {
         self.authority_revision = 0;
         self.last_peer_request = 0;
     }
-    fn expired(&mut self) -> bool {
-        if !self.guest() && self.running() && self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+    fn expired(&mut self) -> bool { self.expired_at(Instant::now()) }
+    fn expired_at(&mut self, now: Instant) -> bool {
+        if !self.guest() && self.running() && self.deadline.is_some_and(|deadline| now >= deadline) {
             self.game.resign(self.game.position.turn, "超时判负");
             let sound = self.result_sound();
             self.position_changed(Some(sound));
@@ -209,9 +256,13 @@ impl Session {
     fn reset_game(&mut self) {
         self.game = Game::new(self.settings.first_side);
         self.game_id += 1;
+        self.phase = GamePhase::Ready;
         self.position_changed(Some("NewGame"));
     }
     fn local_action(&mut self, action: &str, side: Side) -> Result<(), String> {
+        if self.phase == GamePhase::Ready && ["draw", "resign"].contains(&action) {
+            return Err("请先开始对局".into());
+        }
         match action {
             "undo" => {
                 if self.game.history.is_empty() { return Err("还没有可以撤销的着法".into()); }
@@ -242,6 +293,12 @@ impl Session {
     }
     fn lan_action(&mut self, action: &str, side: Side) -> Result<(), String> {
         if self.network.status != "connected" { return Err("请先连接对手".into()); }
+        if ["start", "pause", "resume"].contains(&action) {
+            return Err("开始、暂停和继续由房主控制".into());
+        }
+        if self.phase == GamePhase::Ready && ["draw", "resign"].contains(&action) {
+            return Err("请先等待房主开始对局".into());
+        }
         if action == "resign" { return self.local_action(action, side); }
         if !["undo", "draw", "restart"].contains(&action) { return Err("未知操作".into()); }
         if self.pending.is_some() { return Err("请先处理当前协商请求".into()); }
@@ -280,7 +337,8 @@ impl Session {
         let side = self.network.local_side.ok_or("房间未准备好")?.other();
         match intent {
             Intent::Move { from, to, .. } => {
-                if self.game.result.is_some() || self.game.position.turn != side { return Err("现在还未轮到你落子".into()); }
+                if !self.running() { return Err("当前对局尚未开始或已暂停，不能落子".into()); }
+                if self.game.position.turn != side { return Err("现在还未轮到你落子".into()); }
                 self.apply(ChessMove { from, to })
             }
             Intent::Action { action, .. } => self.lan_action(&action, side),
@@ -438,6 +496,7 @@ impl Hub {
             if session.settings.mode == "lan" { return Err("请先离开联机房间再打开局面".into()); }
             session.game = Game::from_position(position);
             session.game_id += 1;
+            session.phase = GamePhase::Ready;
             session.position_changed(Some("NewGame"));
         }
         Ok(self.refresh())
@@ -448,7 +507,7 @@ impl Hub {
             session.validate_version(revision, game_id)?;
             if session.guest() {
                 let remote = session.remote.as_ref().ok_or("请等待房主同步棋局")?;
-                if session.network.status != "connected" || remote.result.is_some()
+                if session.network.status != "connected" || remote.result.is_some() || remote.phase != GamePhase::Running
                     || session.network.local_side != Some(remote.turn) { return Err("当前不能落子".into()); }
                 if !remote.legal_moves.contains(&ChessMove { from, to }) { return Err("这步棋不合法".into()); }
                 session.request_counter += 1;
@@ -466,18 +525,21 @@ impl Hub {
         let result = {
             let mut session = self.lock();
             session.validate_version(revision, game_id)?;
-            if session.guest() {
+            if ["start", "pause", "resume"].contains(&action) {
+                session.control_phase(action)
+            } else if session.guest() {
                 if session.network.status != "connected" { return Err("请先连接对手".into()); }
                 session.request_counter += 1;
                 let intent = Intent::Action { action: action.into(), revision: session.authority_revision, game_id, request_id: session.request_counter };
                 session.sender.as_ref().ok_or("连接已断开")?.try_send(Wire::Intent { intent }).map_err(|_| "连接繁忙，请稍后重试".to_string())?;
                 return Ok(session.snapshot());
+            } else {
+                session.expired();
+                let side = if session.settings.mode == "local" { session.game.position.turn }
+                    else { session.settings.human_side };
+                if session.settings.mode == "lan" { session.lan_action(action, side) }
+                else { session.local_action(action, side) }
             }
-            session.expired();
-            let side = if session.settings.mode == "local" { session.game.position.turn }
-                else { session.settings.human_side };
-            if session.settings.mode == "lan" { session.lan_action(action, side) }
-            else { session.local_action(action, side) }
         };
         let snapshot = self.refresh();
         result.map(|_| snapshot)
@@ -534,7 +596,8 @@ impl Hub {
                 local_side: None, address: format!("{}:{port}", address.trim()), message: "正在连接房主…".into() };
             session.pending = None;
             session.pending_since = None;
-            session.deadline = None;
+            session.phase = GamePhase::Ready;
+            session.reset_clock();
             session.touch(None);
             let (cancel, receiver) = watch::channel(false);
             session.network_cancel = Some(cancel);
@@ -549,6 +612,9 @@ impl Hub {
             let mut settings = session.settings.clone();
             settings.mode = "local".into();
             storage::save_settings(&self.directory, &settings)?;
+            session.expired();
+            session.freeze_clock(Instant::now());
+            let remaining = session.frozen_remaining;
             let snapshot = session.snapshot();
             if session.guest() && session.remote.is_some() {
                 session.game = Game::from_position(Position { board: snapshot.board, turn: snapshot.turn });
@@ -559,7 +625,9 @@ impl Hub {
             session.settings = settings;
             session.network = NetworkView { message: "已转为本地双人，当前局面保留；访客棋谱从此局面重新记录".into(), ..NetworkView::default() };
             session.game_id += 1;
+            session.phase = if snapshot.phase == GamePhase::Ready { GamePhase::Ready } else { GamePhase::Paused };
             session.position_changed(None);
+            session.frozen_remaining = remaining;
         }
         Ok(self.refresh())
     }
@@ -571,8 +639,7 @@ impl Hub {
             session.sender = Some(sender);
             session.network.status = "connected".into();
             session.network.address = address;
-            session.network.message = "已连接，祝对弈愉快".into();
-            if !session.guest() { session.reset_clock(); }
+            session.network.message = "已连接，等待房主开始对局".into();
             session.touch(None);
         }
         self.refresh();
@@ -607,8 +674,11 @@ impl Hub {
             session.settings.difficulty = snapshot.settings.difficulty;
             session.network.local_side = Some(host_side.other());
             session.network.message = snapshot.network.message.clone();
-            session.deadline = snapshot.remaining_ms.filter(|_| snapshot.result.is_none())
-                .map(|remaining| Instant::now() + Duration::from_millis(remaining));
+            session.phase = snapshot.phase;
+            session.frozen_remaining = snapshot.remaining_ms.map(Duration::from_millis);
+            session.deadline = if snapshot.phase == GamePhase::Running && snapshot.result.is_none() {
+                session.frozen_remaining.take().map(|remaining| Instant::now() + remaining)
+            } else { None };
             let new_sound = session.remote.as_ref().is_some_and(|old| old.action.id != snapshot.action.id);
             if new_sound {
                 let sound = if let Some(result) = &snapshot.result {
@@ -638,16 +708,24 @@ impl Hub {
         {
             let mut session = self.lock();
             if session.connection_id != token || session.network.status == "disconnected" { return; }
+            session.expired();
+            session.freeze_clock(Instant::now());
+            session.cancel_ai();
+            if session.phase == GamePhase::Running { session.phase = GamePhase::Paused; }
             if session.guest() {
                 let remaining = session.remaining();
-                if let Some(remote) = session.remote.as_mut() { remote.remaining_ms = remaining; remote.pending_request = None; }
+                let phase = session.phase;
+                if let Some(remote) = session.remote.as_mut() {
+                    remote.remaining_ms = remaining;
+                    remote.phase = phase;
+                    remote.pending_request = None;
+                }
             }
             session.stop_network();
             session.network.status = "disconnected".into();
             session.network.message = message;
             session.pending = None;
             session.pending_since = None;
-            session.deadline = None;
             session.touch(None);
         }
         let _ = self.app.emit("game:snapshot", self.snapshot());

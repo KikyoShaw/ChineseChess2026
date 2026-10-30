@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import type { Settings, Side } from './types'
+import type { GamePhase, Settings, Side } from './types'
 import { useGame } from './composables/useGame'
 import { clockText, pieceImage, reasonText, requestNames, sideName } from './composables/chess'
 import AppDialog from './components/AppDialog.vue'
@@ -13,7 +13,7 @@ import UiIcon from './components/UiIcon.vue'
 
 const {
   snapshot: game, selected, busy, moving, awaitingPeerAction, connection, startupError, commandError, toasts,
-  inLan, networkReady, canPlay, legalTargets, remainingMs, clockRunning,
+  inLan, networkReady, canPlay, canControl, legalTargets, remainingMs, clockRunning,
   initialize, selectSquare, clearSelection, newGame, performAction, updatePreferences,
   openPosition, savePosition, hostLan, joinLan, leaveLan, respondRequest,
   notify, dismissToast, dismissError,
@@ -29,8 +29,15 @@ const dismissedRequestId = ref<number | null>(null)
 const requestDialogOpen = computed(() => incoming.value && dismissedRequestId.value !== pending.value?.id)
 const canRequest = computed(() => !!game.value && !requestBusy.value && networkReady.value && !pending.value)
 const canUndo = computed(() => canRequest.value && (game.value?.history.length ?? 0) > 0)
-const canEnd = computed(() => canRequest.value && !game.value?.result)
+const canEnd = computed(() => canRequest.value && game.value?.phase !== 'ready' && !game.value?.result)
 const canOpen = computed(() => !!game.value && !inLan.value && !isBusy.value)
+const canConfirm = computed(() => confirmation.value === 'open' ? canOpen.value : confirmation.value === 'restart' ? canRequest.value : canEnd.value)
+const phaseControls: Record<GamePhase, { action: 'start' | 'pause' | 'resume'; label: string; icon: 'play' | 'pause' }> = {
+  ready: { action: 'start', label: '开始', icon: 'play' },
+  running: { action: 'pause', label: '暂停', icon: 'pause' },
+  paused: { action: 'resume', label: '继续', icon: 'play' },
+}
+const phaseControl = computed(() => phaseControls[game.value?.phase ?? 'ready'])
 const modeName = computed(() => !game.value ? '准备棋局' : inLan.value ? '局域网对弈' : game.value.settings.mode === 'computer' ? '人机对弈' : '本地双人')
 const difficultyLabels: Record<number, string> = { 1: '入门', 2: '进阶', 3: '挑战' }
 const difficultyName = computed(() => difficultyLabels[game.value?.settings.difficulty ?? 2] ?? '进阶')
@@ -43,29 +50,94 @@ const resigningSide = computed<Side>(() => {
   if (inLan.value) return game.value.network.localSide ?? game.value.turn
   return game.value.settings.mode === 'computer' ? game.value.settings.humanSide : game.value.turn
 })
+const networkWaitHint = computed(() => {
+  const state = game.value
+  if (!state || networkReady.value) return ''
+  return {
+    offline: '等待建立连接',
+    hosting: '等待对手加入房间，连接后由房主开始',
+    connecting: '正在连接房主，请稍候',
+    disconnected: state.phase === 'ready' ? '连接已断开，棋局尚未开始' : '连接中断，棋局已暂停',
+    connected: '',
+  }[state.network.status]
+})
+const phaseControlHint = computed(() => {
+  const state = game.value
+  if (!state) return '正在准备棋局。'
+  if (state.result) return '本局已结束，请新建对局。'
+  if (!networkReady.value) return networkWaitHint.value
+  if (pending.value) return '请先等待请求处理完成，再开始、暂停或继续对局。'
+  if (requestBusy.value) return '正在同步棋局，请稍候。'
+  if (inLan.value && state.network.role !== 'host') {
+    return state.phase === 'ready' ? '等待房主开始；开始、暂停和继续由房主控制。'
+      : state.phase === 'paused' ? '等待房主继续；开始、暂停和继续由房主控制。' : '房主可暂停对局，访客无法控制开始、暂停或继续。'
+  }
+  return state.phase === 'ready' ? '开始对局，双方即可行棋。'
+    : state.phase === 'paused' ? '继续对局，沿用暂停时的剩余用时。' : '暂停对局，保留剩余用时。'
+})
 const actionHint = computed(() => pending.value ? '请求处理中，请等待对手回应。' : !networkReady.value ? '等待连接完成后可用。' : '')
+const endHint = computed(() => actionHint.value || (game.value?.phase === 'ready' ? '请先开始对局，再提和或认输。' : ''))
 const openHint = computed(() => inLan.value ? '请先离开局域网房间，再打开棋局。' : '打开棋局 · Ctrl+O')
 const restartHint = computed(() => actionHint.value || (inLan.value ? '向对手申请重新开局' : '新对局 · Ctrl+N'))
+const requestTimingHint = computed(() => {
+  const state = game.value
+  if (state?.phase === 'running') return state.settings.stepSeconds
+    ? '继续计时；落子后请求失效，请在 30 秒内回应。'
+    : '仍可落子；落子后请求失效，请在 30 秒内回应。'
+  return state?.phase === 'paused' ? '棋局已暂停，请求仍须在 30 秒内回应。' : '棋局待开始，请求仍须在 30 秒内回应。'
+})
+const turnCaption = computed(() => game.value?.result ? '本局结果' : networkReady.value && game.value?.phase === 'running' ? '当前行棋' : '对局状态')
+const turnTitle = computed(() => {
+  const state = game.value
+  if (!state) return ''
+  if (state.result) return resultTitle.value
+  if (!networkReady.value) return '等待连接'
+  if (state.phase === 'ready') return '等待开始'
+  if (state.phase === 'paused') return '棋局暂停'
+  return `${sideName(state.turn)}行棋`
+})
+const clockLabel = computed(() => {
+  const state = game.value
+  if (!state) return ''
+  if (state.result) return '已结束'
+  if (state.phase === 'ready') return '待开始'
+  if (state.phase === 'paused') return '已暂停'
+  if (!networkReady.value) return '等待连接'
+  return state.settings.stepSeconds ? '每步剩余' : '不限时'
+})
+const clockValue = computed(() => game.value?.result ? '终局' : remainingMs.value === null ? '∞' : clockText(remainingMs.value))
+const clockDescription = computed(() => game.value?.result ? '本局已结束' : `${clockLabel.value}，${remainingMs.value === null ? '不限时' : `剩余 ${clockText(remainingMs.value)}`}`)
 const turnHint = computed(() => {
   const state = game.value
   if (!state) return ''
+  if (!networkReady.value) return networkWaitHint.value
   if (state.result) return reasonText(state.result.reason)
-  if (inLan.value && state.network.status !== 'connected') {
-    return { offline: '等待建立连接', hosting: '等待对手加入房间', connecting: '正在连接对手', disconnected: '连接中断，棋局已暂停' }[state.network.status] ?? ''
-  }
   if (pending.value) return incoming.value ? `对手请求${requestNames[pending.value.kind]}` : `已申请${requestNames[pending.value.kind]}，等待回应`
+  if (state.phase === 'ready') return inLan.value && state.network.role !== 'host'
+    ? '等待房主开始；连接完成后不会自动开局。' : `点击「开始」后，由${sideName(state.turn)}行棋。`
+  if (state.phase === 'paused') return inLan.value && state.network.role !== 'host'
+    ? '等待房主继续，暂停期间不能落子。' : '棋局已暂停，点击「继续」恢复行棋。'
   if (state.thinking) return '电脑正在思考，请稍候'
   if (state.inCheck) return '将军，请应将'
   if (state.settings.mode === 'local') return '两位棋手轮流行棋'
   return canPlay.value ? '轮到你了，从容落子' : '等待对手落子'
 })
 const boardHint = computed(() => {
+  if (!networkReady.value) return networkWaitHint.value
   if (game.value?.result) return '本局已结束，可保存局面或再来一局。'
-  if (pending.value) return '请求等待回应中；仍可落子，落子后请求失效。'
+  if (pending.value) return requestTimingHint.value
   if (awaitingPeerAction.value) return '请求已发送，等待房间同步。'
-  if (!networkReady.value || game.value?.thinking) return turnHint.value
+  if (game.value?.phase !== 'running' || game.value.thinking) return turnHint.value
   if (selected.value !== null) return '请选择落点；再次点选或按 Esc 取消。'
   return canPlay.value ? '点选棋子，再点落点。' : turnHint.value
+})
+const phaseStatus = computed(() => {
+  const state = game.value
+  if (!state) return ''
+  if (!networkReady.value) return '等待连接'
+  if (state.phase === 'ready') return inLan.value && state.network.role !== 'host' ? '等待房主开始' : '待开始'
+  if (state.phase === 'paused') return inLan.value && state.network.role !== 'host' ? '已暂停，等待房主继续' : '已暂停'
+  return '对弈中'
 })
 const networkLabel = computed(() => {
   if (!game.value) return connection.value === 'error' ? '本地服务未连接' : '正在连接本地服务'
@@ -90,15 +162,15 @@ const players = computed(() => {
       name = isMe ? '我方' : state.network.status === 'connected' ? '对手' : '等待对手'
       detail = isMe ? state.network.role === 'host' ? '房主' : '访客' : state.network.role === 'host' ? '访客' : '房主'
     }
-    return { side, name, detail, isMe, isComputer, active: state.turn === side && !state.result && networkReady.value, image: pieceImage({ side, kind: 'king' }) }
+    return { side, name, detail, isMe, isComputer, active: state.phase === 'running' && state.turn === side && !state.result && networkReady.value, image: pieceImage({ side, kind: 'king' }) }
   })
 })
 const confirmCopy = computed(() => {
   switch (confirmation.value) {
     case 'resign': return { title: '确认认输？', description: `${sideName(resigningSide.value)}将认输，本局对弈随即结束。胜负之外，亦有收获。`, label: '确认认输', icon: 'flag', danger: true }
-    case 'draw': return { title: inLan.value ? '向对手提和？' : '以和棋结束本局？', description: inLan.value ? '对手同意后，本局将以和棋结束。等待期间继续计时；落子后请求自动失效。' : game.value?.settings.mode === 'local' ? '请确认两位棋手均同意和棋。确认后，本局对弈结束。' : '电脑将接受和棋，本局对弈随即结束。', label: inLan.value ? '发送和棋请求' : '确认和棋', icon: 'draw', danger: false }
-    case 'open': return { title: '打开已保存的棋局？', description: '所选棋局将替换当前对局。取消文件选择会保留现有棋局。', label: '选择棋局文件', icon: 'folder', danger: false }
-    default: return { title: inLan.value ? '申请重新开局？' : '重新开一局？', description: inLan.value ? '将向对手发送重开请求。对手同意后，双方沿用当前房间设置重新开始。' : '当前对局将被新局替换，新局沿用当前设置。想留住这盘棋，可以先保存。', label: inLan.value ? '发送重开请求' : '重新开局', icon: 'plus', danger: false }
+    case 'draw': return { title: inLan.value ? '向对手提和？' : '以和棋结束本局？', description: inLan.value ? `对手同意后，本局将以和棋结束。${requestTimingHint.value}` : game.value?.settings.mode === 'local' ? '请确认两位棋手均同意和棋。确认后，本局对弈结束。' : '电脑将接受和棋，本局对弈随即结束。', label: inLan.value ? '发送和棋请求' : '确认和棋', icon: 'draw', danger: false }
+    case 'open': return { title: '打开已保存的棋局？', description: '所选棋局将替换当前对局，导入后点击「开始」进入对局。取消文件选择会保留现有棋局。', label: '选择棋局文件', icon: 'folder', danger: false }
+    default: return { title: inLan.value ? '申请重新开局？' : '重新开一局？', description: inLan.value ? `对手同意后，双方沿用当前房间设置准备新局，等待房主点击「开始」。${requestTimingHint.value}` : '当前对局将被新局替换，新局沿用当前设置。点击「开始」后进入对局。想留住这盘棋，可以先保存。', label: inLan.value ? '发送重开请求' : '重新开局', icon: 'plus', danger: false }
   }
 })
 
@@ -124,10 +196,14 @@ function ask(kind: 'restart' | 'resign' | 'draw' | 'open') {
   dismissError()
   confirmation.value = kind
 }
+async function changePhase() {
+  if (!canControl.value) return
+  await performAction(phaseControl.value.action)
+}
 async function confirmAction() {
   const kind = confirmation.value
   const state = game.value
-  if (!kind || !state || isBusy.value) return
+  if (!kind || !state || !canConfirm.value) return
   let success: boolean
   if (kind === 'restart') success = inLan.value ? await performAction('restart') : await newGame({ ...state.settings })
   else if (kind === 'open') success = await openPosition()
@@ -136,7 +212,11 @@ async function confirmAction() {
 }
 async function undo() {
   if (!canUndo.value) return
-  if (await performAction('undo') && !inLan.value) notify('已悔棋，可以重新落子。', 'success')
+  if (await performAction('undo') && !inLan.value) {
+    const message = game.value?.phase === 'running' ? '已悔棋，可以重新落子。'
+      : game.value?.phase === 'paused' ? '已悔棋，棋局保持暂停，点击「继续」后落子。' : '已悔棋，点击「开始」后落子。'
+    notify(message, 'success')
+  }
 }
 async function flip() {
   if (isBusy.value || !game.value) return
@@ -220,7 +300,8 @@ onUnmounted(() => document.removeEventListener('keydown', shortcuts))
 
     <nav class="main-toolbar" aria-label="对局工具栏">
       <div class="toolbar-group">
-        <button class="button button-primary toolbar-new" type="button" :disabled="!canRequest" :title="restartHint" @click="ask('restart')"><UiIcon name="plus" :size="19" /><span>{{ inLan ? '申请重开' : '新对局' }}</span></button>
+        <button class="button button-quiet toolbar-new" type="button" :disabled="!canRequest" :title="restartHint" @click="ask('restart')"><UiIcon name="plus" :size="19" /><span>{{ inLan ? '申请重开' : '新对局' }}</span></button>
+        <button class="button button-primary toolbar-phase" type="button" :disabled="!canControl" :title="phaseControlHint" @click="changePhase"><UiIcon :name="phaseControl.icon" :size="19" /><span>{{ phaseControl.label }}</span></button>
         <button class="toolbar-button" type="button" :disabled="!canUndo" :title="actionHint || '悔棋 · Ctrl+Z'" @click="undo"><UiIcon name="undo" /><span>悔棋</span></button>
         <button class="toolbar-button" type="button" :disabled="!game || isBusy" title="翻转棋盘 · F" :aria-pressed="game?.settings.flipped ?? false" @click="flip"><UiIcon name="flip" /><span>翻转</span></button>
         <span class="toolbar-divider" />
@@ -253,14 +334,14 @@ onUnmounted(() => document.removeEventListener('keydown', shortcuts))
               <div class="player-side"><span :class="player.side === 'red' ? 'text-red' : ''">{{ sideName(player.side) }}</span><small v-if="player.active">行棋中</small><small v-else>{{ index === 0 ? '上方' : '下方' }}</small></div>
             </div>
             <div v-if="index === 0" class="turn-panel" :class="{ 'turn-red': game.turn === 'red', 'turn-result': !!game.result }">
-              <div class="turn-main"><div><p class="eyebrow">{{ game.result ? '本局结果' : '当前行棋' }}</p><h2>{{ game.result ? resultTitle : `${sideName(game.turn)}行棋` }}<span v-if="game.thinking && !game.result" class="thinking-dots" aria-label="电脑思考中"><i /><i /><i /></span><span v-else-if="game.inCheck && !game.result" class="check-badge">将军</span></h2></div><div class="turn-clock" :class="{ 'clock-low': lowTime, 'clock-paused': !clockRunning }"><span>{{ game.result ? '已结束' : game.settings.stepSeconds ? '每步剩余' : '从容思考' }}</span><strong :aria-label="`每步剩余 ${clockText(remainingMs)}`">{{ game.result ? '终局' : remainingMs === null ? '∞' : clockText(remainingMs) }}</strong></div></div>
+              <div class="turn-main"><div><p class="eyebrow">{{ turnCaption }}</p><h2>{{ turnTitle }}<span v-if="game.phase === 'running' && game.thinking && !game.result" class="thinking-dots" aria-label="电脑思考中"><i /><i /><i /></span><span v-else-if="game.inCheck && !game.result" class="check-badge">将军</span></h2></div><div class="turn-clock" :class="{ 'clock-low': lowTime, 'clock-paused': !clockRunning }"><span>{{ clockLabel }}</span><strong :aria-label="clockDescription">{{ clockValue }}</strong></div></div>
               <p class="turn-hint" aria-live="polite">{{ turnHint }}</p>
             </div>
           </template>
         </section>
-        <div v-if="pending || awaitingPeerAction" class="request-waiting" role="status"><span class="spinner" /><span>{{ pending ? `${incoming ? '对手请求' : '已申请'}${requestNames[pending.kind]}` : '请求已发送' }}<small>继续计时；落子后请求失效</small></span><button v-if="incoming" class="request-view-button" type="button" @click="dismissedRequestId = null">查看</button></div>
+        <div v-if="pending || awaitingPeerAction" class="request-waiting" role="status"><span class="spinner" /><span>{{ pending ? `${incoming ? '对手请求' : '已申请'}${requestNames[pending.kind]}` : '请求已发送' }}<small>{{ pending ? requestTimingHint : '等待房间同步' }}</small></span><button v-if="incoming" class="request-view-button" type="button" @click="dismissedRequestId = null">查看</button></div>
         <MoveHistory :history="game.history" />
-        <div class="match-actions"><button class="button button-quiet" type="button" :disabled="!canEnd" :title="actionHint || '提出和棋'" @click="ask('draw')"><UiIcon name="draw" :size="17" />提和</button><button class="button button-quiet resign-button" type="button" :disabled="!canEnd" :title="actionHint || `${sideName(resigningSide)}认输`" @click="ask('resign')"><UiIcon name="flag" :size="17" />认输</button></div>
+        <div class="match-actions"><button class="button button-quiet" type="button" :disabled="!canEnd" :title="endHint || '提出和棋'" @click="ask('draw')"><UiIcon name="draw" :size="17" />提和</button><button class="button button-quiet resign-button" type="button" :disabled="!canEnd" :title="endHint || `${sideName(resigningSide)}认输`" @click="ask('resign')"><UiIcon name="flag" :size="17" />认输</button></div>
       </aside>
     </main>
 
@@ -272,21 +353,21 @@ onUnmounted(() => document.removeEventListener('keydown', shortcuts))
       <template v-else><p class="eyebrow">一局好棋，即将开始</p><h2>正在准备棋盘</h2><p class="connecting-label"><span class="spinner" />连接本地棋局服务…</p></template>
     </main>
 
-    <footer class="status-bar"><div class="status-left" :title="game?.network.message || networkLabel"><i class="connection-indicator" :class="networkClass" /><span>{{ networkLabel }}</span><span v-if="game && inLan && (game.network.message || game.network.address)" class="status-address">{{ game.network.message || game.network.address }}</span></div><div class="status-right"><span v-if="busy" class="status-working"><span class="spinner" />正在处理</span><span v-else-if="moving" class="status-working">正在落子</span><span v-else-if="game?.result" class="status-result">{{ resultTitle }} · {{ reasonText(game.result.reason) }}</span><span v-else-if="game">{{ game.settings.showHints ? '落点提示已开启' : '落点提示已关闭' }}<span class="status-separator">·</span>{{ game.settings.stepSeconds ? `每步 ${game.settings.stepSeconds} 秒` : '不限时对局' }}</span><span v-else>中国象棋 · 桌面版</span></div></footer>
+    <footer class="status-bar"><div class="status-left" :title="game?.network.message || networkLabel"><i class="connection-indicator" :class="networkClass" /><span>{{ networkLabel }}</span><span v-if="game && inLan && (game.network.message || game.network.address)" class="status-address">{{ game.network.message || game.network.address }}</span></div><div class="status-right"><span v-if="busy" class="status-working"><span class="spinner" />正在处理</span><span v-else-if="moving" class="status-working">正在落子</span><span v-else-if="game?.result" class="status-result">{{ resultTitle }} · {{ reasonText(game.result.reason) }}</span><span v-else-if="game">{{ phaseStatus }}<span class="status-separator">·</span>{{ game.settings.showHints ? '落点提示已开启' : '落点提示已关闭' }}<span class="status-separator">·</span>{{ game.settings.stepSeconds ? `每步 ${game.settings.stepSeconds} 秒` : '不限时对局' }}</span><span v-else>中国象棋 · 桌面版</span></div></footer>
 
     <div v-if="commandError && !dialog && !confirmation && !requestDialogOpen" class="error-banner" role="alert"><UiIcon name="alert" :size="18" /><span>{{ commandError }}</span><button class="icon-button" type="button" aria-label="关闭错误提示" @click="dismissError"><UiIcon name="close" :size="17" /></button></div>
     <div class="toast-stack" aria-live="polite" aria-relevant="additions"><TransitionGroup name="toast"><div v-for="toast in toasts" :key="toast.id" class="toast" :class="`toast-${toast.kind}`"><UiIcon :name="toast.kind === 'success' ? 'check' : toast.kind === 'error' ? 'alert' : 'info'" :size="18" /><span>{{ toast.text }}</span><button class="icon-button" type="button" aria-label="关闭通知" @click="dismissToast(toast.id)"><UiIcon name="close" :size="15" /></button></div></TransitionGroup></div>
 
     <SettingsDialog v-if="game" :open="dialog === 'settings'" :settings="game.settings" :busy="isBusy" :lan-locked="inLan" :error="commandError" @close="dialog = null" @save="applySettings" />
-    <LanDialog v-if="game" :open="dialog === 'lan'" :settings="game.settings" :network="game.network" :active="inLan" :busy="isBusy" :error="commandError" @close="dialog = null" @host="createRoom" @join="enterRoom" @leave="exitRoom" />
+    <LanDialog v-if="game" :open="dialog === 'lan'" :phase="game.phase" :settings="game.settings" :network="game.network" :active="inLan" :busy="isBusy" :error="commandError" @close="dialog = null" @host="createRoom" @join="enterRoom" @leave="exitRoom" />
 
     <AppDialog :open="confirmation !== null" :title="confirmCopy.title" eyebrow="落子之前，再想一步" size="small" :dismissible="!isBusy" @close="confirmation = null">
       <div class="confirmation-symbol" :class="{ danger: confirmCopy.danger }"><UiIcon :name="confirmCopy.icon" :size="27" /></div><p class="confirmation-description">{{ confirmCopy.description }}</p><p v-if="commandError" class="form-error" role="alert">{{ commandError }}</p>
-      <template #footer><button class="button button-quiet" type="button" :disabled="isBusy" data-autofocus @click="confirmation = null">再想想</button><button class="button" :class="confirmCopy.danger ? 'button-danger' : 'button-primary'" type="button" :disabled="isBusy" @click="confirmAction"><span v-if="isBusy" class="spinner" />{{ isBusy ? '正在处理' : confirmCopy.label }}</button></template>
+      <template #footer><button class="button button-quiet" type="button" :disabled="isBusy" data-autofocus @click="confirmation = null">再想想</button><button class="button" :class="confirmCopy.danger ? 'button-danger' : 'button-primary'" type="button" :disabled="!canConfirm" @click="confirmAction"><span v-if="isBusy" class="spinner" />{{ isBusy ? '正在处理' : confirmCopy.label }}</button></template>
     </AppDialog>
 
     <AppDialog :open="requestDialogOpen" :title="pending ? `对手请求${requestNames[pending.kind]}` : '对手的请求'" eyebrow="棋逢对手，以礼相待" size="small" :dismissible="!requestBusy" @close="dismissedRequestId = pending?.id ?? null">
-      <div class="confirmation-symbol"><UiIcon :name="pending?.kind === 'undo' ? 'undo' : pending?.kind === 'draw' ? 'draw' : 'plus'" :size="27" /></div><p class="confirmation-description">{{ pending?.kind === 'undo' ? '对手希望退回最近一回合（最多两步）。是否同意此次悔棋？' : pending?.kind === 'draw' ? '对手提议以和棋结束本局。是否同意？' : '对手希望沿用房间设置，重新开始一盘棋。是否同意？' }}</p><p class="form-note">请求期间继续计时。可以收起窗口稍后回应，继续落子会使请求失效。</p><p v-if="commandError" class="form-error" role="alert">{{ commandError }}</p>
+      <div class="confirmation-symbol"><UiIcon :name="pending?.kind === 'undo' ? 'undo' : pending?.kind === 'draw' ? 'draw' : 'plus'" :size="27" /></div><p class="confirmation-description">{{ pending?.kind === 'undo' ? '对手希望退回最近一回合（最多两步）。是否同意此次悔棋？' : pending?.kind === 'draw' ? '对手提议以和棋结束本局。是否同意？' : '对手希望沿用房间设置准备新局，随后由房主点击「开始」。是否同意？' }}</p><p class="form-note">{{ requestTimingHint }}可以收起窗口稍后回应。</p><p v-if="commandError" class="form-error" role="alert">{{ commandError }}</p>
       <template #footer><button class="button button-quiet" type="button" :disabled="requestBusy" data-autofocus @click="answerRequest(false)">谢绝</button><button class="button button-primary" type="button" :disabled="requestBusy" @click="answerRequest(true)"><span v-if="requestBusy" class="spinner" /><UiIcon v-else name="check" :size="18" />{{ requestBusy ? '正在同步' : '同意' }}</button></template>
     </AppDialog>
 

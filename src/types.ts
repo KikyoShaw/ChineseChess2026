@@ -1,6 +1,7 @@
 export type Side = 'red' | 'black'
 export type PieceKind = 'king' | 'rook' | 'horse' | 'cannon' | 'advisor' | 'elephant' | 'pawn'
 export type GameMode = 'computer' | 'local' | 'lan'
+export type GamePhase = 'ready' | 'running' | 'paused'
 export interface Piece { id: number; side: Side; kind: PieceKind }
 export interface ChessMove { from: number; to: number }
 export interface MoveRecord {
@@ -22,10 +23,10 @@ export interface PendingRequest {
 }
 export interface ActionSignal { id: number; sound: string | null }
 export interface Snapshot {
-  revision: number; gameId: number; board: (Piece | null)[]; turn: Side
+  revision: number; gameId: number; phase: GamePhase; board: (Piece | null)[]; turn: Side
   history: MoveRecord[]; result: Outcome | null; inCheck: boolean
   legalMoves: ChessMove[]; settings: Settings; remainingMs: number | null
   thinking: boolean; network: NetworkView; pendingRequest: PendingRequest | null
   action: ActionSignal
 }
-export type ActionName = 'undo' | 'draw' | 'resign' | 'restart'
+export type ActionName = 'undo' | 'draw' | 'resign' | 'restart' | 'start' | 'pause' | 'resume'

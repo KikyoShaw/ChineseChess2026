@@ -17,7 +17,7 @@ use tokio::{
 
 use crate::session::{Hub, Snapshot};
 
-pub const PROTOCOL: u16 = 1;
+pub const PROTOCOL: u16 = 2;
 
 const MAX_FRAME: usize = 64 * 1024;
 const MAX_STATE: usize = 8 * 1024 * 1024;
